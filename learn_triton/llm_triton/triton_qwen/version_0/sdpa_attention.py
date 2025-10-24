@@ -49,13 +49,14 @@ def functional_scaled_dot_product_attention(query, key, value, attn_mask=None, d
         scores = scores.masked_fill(~causal_mask, float('-inf'))
 
     # Step 3: Softmax over last dim (Lk)
-    attn_weights = F.softmax(scores, dim=-1)
+    attn_weights = F.softmax(scores, dim=-1) # shape = (B, H, Lq, Lk)
 
     # Step 4: Apply dropout
     if dropout_p > 0.0:
         attn_weights = F.dropout(attn_weights, p=dropout_p)
 
     # Step 5: Compute output
+    # value shape: (B, H, Lk, D)
     attn_output = torch.matmul(attn_weights, value)  # shape: (B, H, Lq, D)
 
     return attn_output
