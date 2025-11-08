@@ -1,6 +1,6 @@
-# CUDA notebook
+# GPU notebook
 
-Notebook for learning cuda.
+Notebook for learning GPU kernel.
 
 ## Task0: optimizing gemm step by step
 

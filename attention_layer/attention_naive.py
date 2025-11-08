@@ -102,10 +102,11 @@ BLOCK_M = 128
 BLOCK_N = 128
 BLOCK_K = 32
 
-# def _triton_attention_kernel(
+# def _triton_attention_kernel()
 #     Q_ptr, K_ptr, V_ptr, Out_ptr,
 
-
+# 这里使用的维度是 (B, H, L, D)，和pytorch 的维度是一样的
+# 官方使用的维度是： (B, L, H, D)，需要注意区分：https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
 def functional_attention_triton_v1(query, key, value, attn_mask=None, scale=None, is_causal=False):
     """
     Manual implementation of scaled dot-product attention similar to PyTorch's F.scaled_dot_product_attention.
