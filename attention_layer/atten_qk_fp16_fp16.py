@@ -19,443 +19,6 @@ import triton
 import triton.language as tl
 
 @triton.jit
-def _attn_fwd_inner_qk_int8_pv_fp16(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
-                    K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
-                    start_m, mask_ptrs, stride_maskn,
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr
-                    ):
-    lo, hi = 0, kv_len
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_block = None
-        skip = False
-        if mask_ptrs is not None:
-            if mask_ptrs.dtype.element_ty == tl.int1:
-                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
-                if tl.max(mask_block) == 0:
-                    skip = True
-            else:
-                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
-        if not skip:
-            k_mask = offs_n[None, :] < (kv_len - start_n)
-            k = tl.load(K_ptrs, mask=k_mask)
-            k_scale = tl.load(K_scale_ptr)
-
-            qk = tl.dot(q, k).to(tl.float32) * (q_scale * k_scale)
-            
-            if mask_block is not None:
-                if mask_block.dtype == tl.int1:
-                    qk = qk + tl.where(mask_block, 0, -1.0e6)
-                else:
-                    qk = qk + mask_block
-            else:
-                qk += tl.where(k_mask, 0, -1.0e6)
-
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk = qk - m_ij[:, None]
-            p = tl.math.exp2(qk)
-            l_ij = tl.sum(p, 1)
-            
-            alpha = tl.math.exp2(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
-            
-            acc = acc * alpha[:, None]
-            
-            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
-            p = p.to(tl.float16)
-            
-            acc += tl.dot(p, v, out_dtype=tl.float16)   
-            m_i = m_ij
-        K_ptrs += BLOCK_N * stride_kn
-        K_scale_ptr += 1
-        V_ptrs += BLOCK_N * stride_vn
-    return acc, l_i, m_i
-
-
-@triton.jit
-def _attn_fwd_qk_int8_pv_fp16(Q, K, V, Q_scale, K_scale, v_scale, Out, mask, Lse, 
-              stride_qz, stride_qh, stride_qn,
-              stride_kz, stride_kh, stride_kn,  
-              stride_vz, stride_vh, stride_vn,  
-              stride_oz, stride_oh, stride_on, 
-              stride_maskz, stride_maskh, stride_maskm, stride_maskn,
-              qo_len, kv_len, H: tl.constexpr, num_kv_groups: tl.constexpr,
-              HEAD_DIM: tl.constexpr,  
-              BLOCK_M: tl.constexpr,  
-              BLOCK_N: tl.constexpr,  
-              STAGE: tl.constexpr
-              ):
-    start_m = tl.program_id(0)
-
-    off_z = tl.program_id(2).to(tl.int64)
-    off_h = tl.program_id(1).to(tl.int64)
-
-    q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_M)
-    k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)  
-    
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, HEAD_DIM)
-    Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :]
-    Q_scale_ptr = Q_scale + q_scale_offset + start_m
-    K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None] 
-    K_scale_ptr = K_scale + k_scale_offset
-    V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
-    O_block_ptr = Out + (off_z * stride_oz + off_h * stride_oh) + offs_m[:, None] * stride_on + offs_k[None, :]
-    if mask is None:
-        mask_ptrs = None
-    else:
-        mask_ptrs = mask + (off_z * stride_maskz + off_h * stride_maskh) + offs_m[:, None] * stride_maskm + offs_n[None, :] * stride_maskn
-
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    
-    q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
-    q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner_qk_int8_pv_fp16(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
-                                    start_m, mask_ptrs, stride_maskn,
-                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    4 - STAGE, offs_m, offs_n 
-                                    )
-    acc = acc / l_i[:, None]
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
-
-
-@triton.jit
-def _attn_fwd_inner_qk_fp16_pv_fp16(acc, l_i, m_i, q, qo_len, kv_len,
-                    K_ptrs, V_ptrs, stride_kn, stride_vn, 
-                    start_m, mask_ptrs, stride_maskn,
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,
-                    HAS_MASK: tl.constexpr):
-    lo, hi = 0, kv_len
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_block = None
-        skip = False
-        if HAS_MASK:
-            # mask_ptrs base should be passed without column offset; add start_n here
-            mask_block = tl.load(mask_ptrs + start_n * stride_maskn,
-                                 mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n),
-                                 other=False)
-            # use tl.any/tl.max on casted int
-            if tl.max(mask_block.to(tl.int32)) == 0:
-                skip = True
-        if not skip:
-            k_mask = offs_n[None, :] < (kv_len - start_n)   # shape [1, BLOCK_N] -> broadcast to [HEAD_DIM, BLOCK_N]
-            k = tl.load(K_ptrs, mask=k_mask, other=0.0)    # K_ptrs shape [HEAD_DIM, BLOCK_N]
-
-            qk = tl.dot(q, k).to(tl.float16) # [BLOCK_M, BLOCK_N]
-            
-            if HAS_MASK:
-                if mask_block.dtype == tl.int1:
-                    qk = qk + tl.where(mask_block, 0.0, -1.0e6)
-                else:
-                    qk = qk + mask_block
-            else:
-                qk = qk + tl.where(k_mask, 0.0, -1.0e6)
-
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk = qk - m_ij[:, None]
-            p = tl.math.exp(qk)                 # use exp for clarity
-            l_ij = tl.sum(p, 1)
-
-            alpha = tl.math.exp(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
-            acc = acc * alpha[:, None]
-
-            v_mask = offs_n[:, None] < (kv_len - start_n)   # V_ptrs is [BLOCK_N, HEAD_DIM]
-            v = tl.load(V_ptrs, mask=v_mask, other=0.0)
-            p = p.to(tl.float16)
-            # keep p in float32 to compute dot in float32
-            acc += tl.dot(p, v, out_dtype=tl.float32)
-            m_i = m_ij
-        K_ptrs += BLOCK_N * stride_kn
-        V_ptrs += BLOCK_N * stride_vn
-    return acc, l_i, m_i
-
-
-@triton.jit
-def _attn_fwd_qk_fp16_pv_fp16(Q, K, V, Q_scale, K_scale, v_scale, Out, mask, Lse, 
-              stride_qz, stride_qh, stride_qn,
-              stride_kz, stride_kh, stride_kn,  
-              stride_vz, stride_vh, stride_vn,  
-              stride_oz, stride_oh, stride_on, 
-              stride_maskz, stride_maskh, stride_maskm, stride_maskn,
-              qo_len, kv_len, H: tl.constexpr, num_kv_groups: tl.constexpr,
-              HEAD_DIM: tl.constexpr,  
-              BLOCK_M: tl.constexpr,  
-              BLOCK_N: tl.constexpr,  
-              STAGE: tl.constexpr
-              ):
-    start_m = tl.program_id(0)
-
-    off_z = tl.program_id(2).to(tl.int64)
-    off_h = tl.program_id(1).to(tl.int64)
-
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, HEAD_DIM)
-    Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :]
-    K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None]
-    V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
-    O_block_ptr = Out + (off_z * stride_oz + off_h * stride_oh) + offs_m[:, None] * stride_on + offs_k[None, :]
-    if mask is None:
-        mask_ptrs = None
-    else:
-        mask_ptrs = mask + (off_z * stride_maskz + off_h * stride_maskh) + offs_m[:, None] * stride_maskm + offs_n[None, :] * stride_maskn
-
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    
-    q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
-    acc, l_i, m_i = _attn_fwd_inner_qk_fp16_pv_fp16(acc, l_i, m_i, q, qo_len, kv_len, K_ptrs, V_ptrs, stride_kn, stride_vn,
-                                    start_m, mask_ptrs, stride_maskn,
-                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
-                                    4 - STAGE, offs_m, offs_n, False
-                                    )
-    acc = acc / l_i[:, None]
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
-
-
-@triton.jit
-def compute_scale_vectorized(x, BLOCK_SIZE: tl.constexpr):
-    """向量化的scale计算"""
-    # 使用向量操作计算最大值
-    abs_max = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-    
-    for i in range(0, BLOCK_SIZE):
-        val = tl.load(x + i).to(tl.float32)
-        abs_max = tl.where(i == tl.arange(0, BLOCK_SIZE), tl.abs(val), abs_max)
-    
-    # 在向量中找最大值
-    max_val = tl.max(abs_max, axis=0)
-    
-    # 计算scale
-    safe_max = tl.maximum(max_val, 1e-8)
-    scale = 127.0 / safe_max
-    
-    return scale
-
-
-@triton.jit
-def quantize_fp16_to_int8(x, scale):
-    """量化FP16到INT8"""
-    # 应用scale并四舍五入到最近的整数
-    x_scaled = x * scale
-    # 限制在INT8范围内 [-128, 127]
-    x_quant = tl.clamp(x_scaled, 0.0, 127.0).to(tl.int8)
-    # x_clipped = tl.minimum(tl.maximum(x_scaled, -128.0), 127.0)
-    # 四舍五入并转换为INT8
-    # x_quant = tl.math.round(x_clipped).to(tl.int8)
-    return x_quant
-
-
-@triton.jit
-def compute_scale_fp16_to_int8(x, BLOCK_SIZE: tl.constexpr):
-    """计算量化scale"""
-    # 找到绝对值的最大值
-    abs_max = tl.zeros([1], dtype=tl.float32)
-    
-    for i in range(0, BLOCK_SIZE):
-        val = tl.load(x + i).to(tl.float32)
-        abs_val = tl.abs(val)
-        abs_max = tl.maximum(abs_max, abs_val)
-    
-    # 计算scale: 127.0 / abs_max
-    # 防止除零
-    safe_abs_max = tl.maximum(abs_max, 1e-8)
-    scale = 127.0 / safe_abs_max
-    
-    return scale
-
-
-@triton.jit
-def _attn_fwd_inner_qk_int8_pv_int8(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
-                    K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, stride_kn, stride_vn, 
-                    start_m, mask_ptrs, stride_maskn,
-                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
-                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr
-                    ):
-    lo, hi = 0, kv_len
-    for start_n in range(lo, hi, BLOCK_N):
-        start_n = tl.multiple_of(start_n, BLOCK_N)
-        mask_block = None
-        skip = False
-        if mask_ptrs is not None:
-            if mask_ptrs.dtype.element_ty == tl.int1:
-                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
-                if tl.max(mask_block) == 0:
-                    skip = True
-            else:
-                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
-        if not skip:
-            k_mask = offs_n[None, :] < (kv_len - start_n)
-            k = tl.load(K_ptrs, mask=k_mask)
-            k_scale = tl.load(K_scale_ptr)
-
-            qk = tl.dot(q, k, out_dtype=tl.float32)* (q_scale * k_scale)
-
-            if mask_block is not None:
-                if mask_block.dtype == tl.int1:
-                    qk = qk + tl.where(mask_block, 0, -1.0e6)
-                else:
-                    qk = qk + mask_block
-            else:
-                qk += tl.where(k_mask, 0, -1.0e6)
-
-            m_ij = tl.maximum(m_i, tl.max(qk, 1))
-            qk = qk - m_ij[:, None]
-            p = tl.math.exp2(qk)
-            l_ij = tl.sum(p, 1)
-            
-            alpha = tl.math.exp2(m_i - m_ij)
-            l_i = l_i * alpha + l_ij
-            
-            acc = acc * alpha[:, None]
-            
-            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
-            k_scale = tl.load(K_scale_ptr)
-            v_scale = tl.load(V_scale_ptr)
-
-            # # block 内求 max(abs(x))
-            # abs_p = tl.abs(p)
-            # max_val = tl.max(abs_p, 0)                     # shape: [BLOCK_N]
-            # p_scale = max_val / 127.0                      # per-column scale [BLOCK_N]
-
-            # p = (p / p_scale)
-            # p = tl.clamp(p, -128, 127)
-            # p = tl.cast(p, tl.int8)
-
-            absmax = tl.maximum(tl.max(tl.abs(p)), 1e-10)
-            scale_x = absmax / 127
-
-            p_q = p * (127 / absmax)
-            p_q = tl.extra.cuda.libdevice.round(p_q).to(tl.int8)
-
-            # scale_v = p_scale * v_scale
-            acc_f32 = tl.dot(p_q, v, out_dtype=tl.float32) * scale_x * v_scale
-            acc += acc_f32
-
-            m_i = m_ij
-
-        K_ptrs += BLOCK_N * stride_kn
-        K_scale_ptr += 1
-        V_ptrs += BLOCK_N * stride_vn
-        V_scale_ptr += 1
-    return acc, l_i, m_i
-
-@triton.jit
-def _attn_fwd_qk_int8_pv_int8(Q, K, V, Q_scale, K_scale, V_scale, Out, mask, Lse, 
-              stride_qz, stride_qh, stride_qn,
-              stride_kz, stride_kh, stride_kn,  
-              stride_vz, stride_vh, stride_vn,  
-              stride_oz, stride_oh, stride_on, 
-              stride_maskz, stride_maskh, stride_maskm, stride_maskn,
-              qo_len, kv_len, H: tl.constexpr, num_kv_groups: tl.constexpr,
-              HEAD_DIM: tl.constexpr,  
-              BLOCK_M: tl.constexpr,  
-              BLOCK_N: tl.constexpr,  
-              STAGE: tl.constexpr
-              ):
-    start_m = tl.program_id(0)
-
-    off_z = tl.program_id(2).to(tl.int64)
-    off_h = tl.program_id(1).to(tl.int64)
-
-    q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_M)
-    k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)  
-    
-    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
-    offs_k = tl.arange(0, HEAD_DIM)
-    Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :]
-    Q_scale_ptr = Q_scale + q_scale_offset + start_m
-    K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None]
-    K_scale_ptr = K_scale + k_scale_offset
-    V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
-    V_scale_ptr = V_scale + (off_z * (H // num_kv_groups) + off_h // num_kv_groups) 
-    O_block_ptr = Out + (off_z * stride_oz + off_h * stride_oh) + offs_m[:, None] * stride_on + offs_k[None, :]
-    if mask is None:
-        mask_ptrs = None
-    else:
-        mask_ptrs = mask + (off_z * stride_maskz + off_h * stride_maskh) + offs_m[:, None] * stride_maskm + offs_n[None, :] * stride_maskn
-
-    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
-    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32)
-    
-    q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
-    q_scale = tl.load(Q_scale_ptr)
-
-    acc, l_i, m_i = _attn_fwd_inner_qk_int8_pv_int8(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, V_scale_ptr, stride_kn, stride_vn,
-                                    start_m, mask_ptrs, stride_maskn,
-                                    BLOCK_M, HEAD_DIM, BLOCK_N,
-                                    4 - STAGE, offs_m, offs_n
-                                    )
-    acc = acc / l_i[:, None]
-    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
-
-
-# 输入 是 q,k,v 都是int8， scale 是 float16
-def atten_forward(forward_function, q, k, v, q_scale, k_scale, v_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16):
-    BLOCK_M = 128
-    BLOCK_N = 64
-    stage = 1
-
-    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
-
-    if tensor_layout == "HND":
-        b, h_qo, qo_len, head_dim = q.shape
-        _, h_kv, kv_len, _ = k.shape
-
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
-        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
-        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(1), o.stride(2)
-    elif tensor_layout == "NHD":
-        b, qo_len, h_qo, head_dim = q.shape
-        _, kv_len, h_kv, _ = k.shape
-
-        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
-        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
-        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
-        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(2), o.stride(1)
-    else:
-        raise ValueError(f"tensor_layout {tensor_layout} not supported")
-
-    if attn_mask is not None:
-        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = attn_mask.stride(0), attn_mask.stride(1), attn_mask.stride(2), attn_mask.stride(3)
-    else:
-        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = 0, 0, 0, 0
-
-    HEAD_DIM_K = head_dim
-    num_kv_groups = h_qo // h_kv
-
-    lse = torch.empty([0], dtype=torch.float32, device='cpu')
-
-    grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
-    forward_function[grid](
-        q, k, v, q_scale, k_scale, v_scale, o, attn_mask, lse,
-        stride_bz_q, stride_h_q, stride_seq_q, 
-        stride_bz_k, stride_h_k, stride_seq_k,  
-        stride_bz_v, stride_h_v, stride_seq_v,  
-        stride_bz_o, stride_h_o, stride_seq_o,
-        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask,
-        qo_len, kv_len,
-        h_qo, num_kv_groups,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,  
-        STAGE=stage,
-        num_warps=4 if head_dim == 64 else 8,
-        num_stages=3 if head_dim == 64 else 4)
-
-    return o
-
-
-@triton.jit
 def quant_per_block_int8_kernel(Input, Output, Scale, L,
                                 stride_iz, stride_ih, stride_in,
                                 stride_oz, stride_oh, stride_on,
@@ -540,7 +103,122 @@ def per_block_int8(q, k, km=None, BLKQ=128, BLKK=64, sm_scale=None, tensor_layou
 
 
 @triton.jit
-def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
+def _attn_fwd_inner_qk_fp16_pv_fp16(acc, l_i, m_i, q, qo_len, kv_len,
+                    K_ptrs, V_ptrs, stride_kn, stride_vn, 
+                    start_m, mask_ptrs, stride_maskn,
+                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
+                    ):
+    lo, hi = 0, kv_len
+    for start_n in range(lo, hi, BLOCK_N): # 计算时，B,H是一一对应的，seq一次计算N块
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_block = None
+        skip = False
+        if mask_ptrs is not None:
+            if mask_ptrs.dtype.element_ty == tl.int1:
+                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
+                if tl.max(mask_block) == 0:
+                    skip = True
+            else:
+                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
+        if not skip:
+            k_mask = offs_n[None, :] < (kv_len - start_n)
+            k = tl.load(K_ptrs, mask=k_mask)
+            # k_scale = tl.load(K_scale_ptr)
+
+            qk = tl.dot(q, k, out_dtype=tl.float32) * 0.0883883 #* (q_scale * k_scale)
+            
+            if mask_block is not None:
+                if mask_block.dtype == tl.int1:
+                    qk = qk + tl.where(mask_block, 0, -1.0e6)
+                else:
+                    qk = qk + mask_block
+            else:
+                qk += tl.where(k_mask, 0, -1.0e6)
+
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk = qk - m_ij[:, None]
+            p = tl.math.exp2(qk)
+            l_ij = tl.sum(p, 1)
+            
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            
+            acc = acc * alpha[:, None]
+            
+            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+            # p = p.to(tl.float16)
+            
+            acc += tl.dot(p, v, out_dtype=tl.float32)
+            m_i = m_ij
+        K_ptrs += BLOCK_N * stride_kn
+        # K_scale_ptr += 1
+        V_ptrs += BLOCK_N * stride_vn
+    return acc, l_i, m_i
+
+@triton.jit
+def _attn_fwd_qk_fp16_pv_fp16(Q, K, V, Out, mask, Lse, 
+              stride_qz, stride_qh, stride_qn, # q的 B,H,len
+              stride_kz, stride_kh, stride_kn, # k的 B,H,len
+              stride_vz, stride_vh, stride_vn, # v的 B,H,len
+              stride_oz, stride_oh, stride_on, # out的 B,H,len
+              stride_maskz, stride_maskh, stride_maskm, stride_maskn,
+              qo_len, kv_len, H: tl.constexpr, num_kv_groups: tl.constexpr,
+              HEAD_DIM: tl.constexpr,  
+              BLOCK_M: tl.constexpr,  
+              BLOCK_N: tl.constexpr,  
+              STAGE: tl.constexpr,
+              RETURN_LSE: tl.constexpr,
+              ):
+    start_m = tl.program_id(0)            # inside q_len // BLOCK_M
+
+    off_z = tl.program_id(2).to(tl.int64) # batch index
+    off_h = tl.program_id(1).to(tl.int64) # head index
+
+    # q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_M)
+    # k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)  
+    
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M) # 一次处理M块
+    offs_n = tl.arange(0, BLOCK_N)                     # 一次处理N块
+    offs_k = tl.arange(0, HEAD_DIM)                    # head_dim # 这个对应于 D
+    Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :] # 取出 MxD的块
+    # Q_scale_ptr = Q_scale + q_scale_offset + start_m
+    K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None] # 对于group attention，来说，要找到正确的head组 提取出NxD的块
+    # K_scale_ptr = K_scale + k_scale_offset
+    V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
+    O_block_ptr = Out + (off_z * stride_oz + off_h * stride_oh) + offs_m[:, None] * stride_on + offs_k[None, :] # 输出的 MxD块
+    if mask is None:
+        mask_ptrs = None
+    else:
+        mask_ptrs = mask + (off_z * stride_maskz + off_h * stride_maskh) + offs_m[:, None] * stride_maskm + offs_n[None, :] * stride_maskn
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float32) # 对应输出的 M x D 块
+    
+    q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
+    # q_scale = tl.load(Q_scale_ptr)
+    
+    # acc, l_i, m_i, q, q_scale, qo_len, kv_len,
+    # K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
+    # start_m, mask_ptrs, stride_maskn,
+    # BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
+    # STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
+    acc, l_i, m_i = _attn_fwd_inner_qk_fp16_pv_fp16(acc, l_i, m_i, q, qo_len, kv_len, K_ptrs, V_ptrs, stride_kn, stride_vn,
+                                    start_m, mask_ptrs, stride_maskn,
+                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
+                                    4 - STAGE, offs_m, offs_n 
+                                    )
+    acc = acc / l_i[:, None] # 相当于 softmax 滞后除法。
+    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
+
+    if RETURN_LSE:
+        lse_ptrs = Lse + (off_z * qo_len * H + off_h * qo_len) + offs_m
+        l_i = tl.log2(l_i) + m_i
+        tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
+
+@triton.jit
+def _attn_fwd_inner_qk_int8_pv_fp16(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
                     K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
                     start_m, mask_ptrs, stride_maskn,
                     BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
@@ -594,7 +272,7 @@ def _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len,
     return acc, l_i, m_i
 
 @triton.jit
-def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse, 
+def _attn_fwd_qk_int8_pv_fp16(Q, K, V, Q_scale, K_scale, Out, mask, Lse, 
               stride_qz, stride_qh, stride_qn,
               stride_kz, stride_kh, stride_kn,  
               stride_vz, stride_vh, stride_vn,  
@@ -635,7 +313,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
     
     q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
     q_scale = tl.load(Q_scale_ptr)
-    acc, l_i, m_i = _attn_fwd_inner(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
+    acc, l_i, m_i = _attn_fwd_inner_qk_int8_pv_fp16(acc, l_i, m_i, q, q_scale, qo_len, kv_len, K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn,
                                     start_m, mask_ptrs, stride_maskn,
                                     BLOCK_M, HEAD_DIM, BLOCK_N,  
                                     4 - STAGE, offs_m, offs_n 
@@ -648,7 +326,7 @@ def _attn_fwd(Q, K, V, Q_scale, K_scale, Out, mask, Lse,
         l_i = tl.log2(l_i) + m_i
         tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
 
-def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False):
+def forward_qk_int8_pv_fp16(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, output_dtype=torch.float16, return_lse=False):
     BLOCK_M = 128
     BLOCK_N = 64
     stage = 1
@@ -688,7 +366,7 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, outp
         lse = torch.empty([0], dtype=torch.float32, device='cpu')
 
     grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b)
-    _attn_fwd[grid](
+    _attn_fwd_qk_int8_pv_fp16[grid](
         q, k, v, q_scale, k_scale, o, attn_mask, lse,
         stride_bz_q, stride_h_q, stride_seq_q, 
         stride_bz_k, stride_h_k, stride_seq_k,  
@@ -704,13 +382,280 @@ def forward(q, k, v, q_scale, k_scale, tensor_layout="HND", attn_mask=None, outp
 
     return o, lse
 
+
+def forward_qk_fp16_pv_fp16(q, k, v, tensor_layout="HND", attn_mask=None, output_dtype=torch.float32, return_lse=False):
+    BLOCK_M = 16
+    BLOCK_N = 16
+    stage = 1
+
+    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+
+    if tensor_layout == "HND":
+        b, h_qo, qo_len, head_dim = q.shape
+        _, h_kv, kv_len, _ = k.shape
+
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
+        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
+        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(1), o.stride(2)
+    elif tensor_layout == "NHD":
+        b, qo_len, h_qo, head_dim = q.shape
+        _, kv_len, h_kv, _ = k.shape
+
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
+        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
+        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(2), o.stride(1)
+    else:
+        raise ValueError(f"tensor_layout {tensor_layout} not supported")
+
+    if attn_mask is not None:
+        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = attn_mask.stride(0), attn_mask.stride(1), attn_mask.stride(2), attn_mask.stride(3)
+    else:
+        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = 0, 0, 0, 0
+
+    HEAD_DIM_K = head_dim
+    num_kv_groups = h_qo // h_kv
+
+    if return_lse:
+        lse = torch.empty([b, h_qo, qo_len], dtype=torch.float32, device=q.device)
+    else:
+        lse = torch.empty([0], dtype=torch.float32, device='cpu')
+
+    grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b) # grid 是按照 q来划分的， N是内部的for循环，对应的是 b, h, len_k / BLOCK_N的划分，其中，按照规则，b和h是对应的，类似于矩阵乘法。
+    _attn_fwd_qk_fp16_pv_fp16[grid](
+        q, k, v, o, attn_mask, lse,
+        stride_bz_q, stride_h_q, stride_seq_q, 
+        stride_bz_k, stride_h_k, stride_seq_k,  
+        stride_bz_v, stride_h_v, stride_seq_v,  
+        stride_bz_o, stride_h_o, stride_seq_o,
+        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask,
+        qo_len, kv_len,
+        h_qo, num_kv_groups,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,   # q_split, N, head_dim # 其中N 是
+        STAGE=stage, RETURN_LSE=return_lse,
+        num_warps=4 if head_dim == 64 else 8,
+        num_stages=3 if head_dim == 64 else 4)
+
+    return o, lse
+
+
+@triton.jit
+def _attn_fwd_inner_qk_fp16_pv_fp16_v2(acc, l_i, m_i, q, qo_len, kv_len,
+                    K_ptrs, V_ptrs, stride_kn, stride_vn, 
+                    start_m, mask_ptrs, stride_maskn,
+                    BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
+                    STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
+                    ):
+    lo, hi = 0, kv_len
+    for start_n in range(lo, hi, BLOCK_N): # 计算时，B,H是一一对应的，seq一次计算N块
+        start_n = tl.multiple_of(start_n, BLOCK_N)
+        mask_block = None
+        skip = False
+        if mask_ptrs is not None:
+            if mask_ptrs.dtype.element_ty == tl.int1:
+                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=False)
+                if tl.max(mask_block) == 0:
+                    skip = True
+            else:
+                mask_block = tl.load(mask_ptrs + start_n * stride_maskn, mask=(offs_m[:, None] < qo_len) & (offs_n[None, :] < kv_len - start_n), other=-1.0e6)
+        if not skip:
+            k_mask = offs_n[None, :] < (kv_len - start_n)
+            k = tl.load(K_ptrs, mask=k_mask)
+            # k_scale = tl.load(K_scale_ptr)
+
+            qk = tl.dot(q, k, out_dtype=tl.float16) * 0.0883883 #* (q_scale * k_scale)
+            
+            if mask_block is not None:
+                if mask_block.dtype == tl.int1:
+                    qk = qk + tl.where(mask_block, 0, -1.0e6)
+                else:
+                    qk = qk + mask_block
+            else:
+                qk += tl.where(k_mask, 0, -1.0e6)
+
+            m_ij = tl.maximum(m_i, tl.max(qk, 1))
+            qk = qk - m_ij[:, None]
+            p = tl.math.exp2(qk)
+            l_ij = tl.sum(p, 1)
+            
+            alpha = tl.math.exp2(m_i - m_ij)
+            l_i = l_i * alpha + l_ij
+            
+            alpha = alpha.to(tl.float16)
+            acc = acc * alpha[:, None]
+            
+            v = tl.load(V_ptrs, mask = offs_n[:, None] < (kv_len - start_n))
+            p = p.to(tl.float16)
+            
+            acc += tl.dot(p, v, out_dtype=tl.float16)
+            m_i = m_ij
+        K_ptrs += BLOCK_N * stride_kn
+        # K_scale_ptr += 1
+        V_ptrs += BLOCK_N * stride_vn
+    return acc, l_i, m_i
+
+@triton.jit
+def _attn_fwd_qk_fp16_pv_fp16_v2(Q, K, V, Out, mask, Lse, 
+              stride_qz, stride_qh, stride_qn, # q的 B,H,len
+              stride_kz, stride_kh, stride_kn, # k的 B,H,len
+              stride_vz, stride_vh, stride_vn, # v的 B,H,len
+              stride_oz, stride_oh, stride_on, # out的 B,H,len
+              stride_maskz, stride_maskh, stride_maskm, stride_maskn,
+              qo_len, kv_len, H: tl.constexpr, num_kv_groups: tl.constexpr,
+              HEAD_DIM: tl.constexpr,  
+              BLOCK_M: tl.constexpr,  
+              BLOCK_N: tl.constexpr,  
+              STAGE: tl.constexpr,
+              RETURN_LSE: tl.constexpr,
+              ):
+    start_m = tl.program_id(0)            # inside q_len // BLOCK_M
+
+    off_z = tl.program_id(2).to(tl.int64) # batch index
+    off_h = tl.program_id(1).to(tl.int64) # head index
+
+    # q_scale_offset = (off_z * H + off_h) * tl.cdiv(qo_len, BLOCK_M)
+    # k_scale_offset = (off_z * (H // num_kv_groups) + off_h // num_kv_groups) * tl.cdiv(kv_len, BLOCK_N)  
+    
+    offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M) # 一次处理M块
+    offs_n = tl.arange(0, BLOCK_N)                     # 一次处理N块
+    offs_k = tl.arange(0, HEAD_DIM)                    # head_dim # 这个对应于 D
+    Q_ptrs = Q + (off_z * stride_qz + off_h * stride_qh) + offs_m[:, None] * stride_qn + offs_k[None, :] # 取出 MxD的块
+    # Q_scale_ptr = Q_scale + q_scale_offset + start_m
+    K_ptrs = K + (off_z * stride_kz + (off_h // num_kv_groups) * stride_kh) + offs_n[None, :] * stride_kn + offs_k[:, None] # 对于group attention，来说，要找到正确的head组 提取出NxD的块
+    # K_scale_ptr = K_scale + k_scale_offset
+    V_ptrs = V + (off_z * stride_vz + (off_h // num_kv_groups) * stride_vh) + offs_n[:, None] * stride_vn + offs_k[None, :]
+    O_block_ptr = Out + (off_z * stride_oz + off_h * stride_oh) + offs_m[:, None] * stride_on + offs_k[None, :] # 输出的 MxD块
+    if mask is None:
+        mask_ptrs = None
+    else:
+        mask_ptrs = mask + (off_z * stride_maskz + off_h * stride_maskh) + offs_m[:, None] * stride_maskm + offs_n[None, :] * stride_maskn
+
+    m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    acc = tl.zeros([BLOCK_M, HEAD_DIM], dtype=tl.float16) # 对应输出的 M x D 块
+    
+    q = tl.load(Q_ptrs, mask = offs_m[:, None] < qo_len)
+    # q_scale = tl.load(Q_scale_ptr)
+    
+    # acc, l_i, m_i, q, q_scale, qo_len, kv_len,
+    # K_ptrs, K_scale_ptr, V_ptrs, stride_kn, stride_vn, 
+    # start_m, mask_ptrs, stride_maskn,
+    # BLOCK_M: tl.constexpr, HEAD_DIM: tl.constexpr, BLOCK_N: tl.constexpr,  
+    # STAGE: tl.constexpr, offs_m: tl.constexpr, offs_n: tl.constexpr,  
+    acc, l_i, m_i = _attn_fwd_inner_qk_fp16_pv_fp16_v2(acc, l_i, m_i, q, qo_len, kv_len, K_ptrs, V_ptrs, stride_kn, stride_vn,
+                                    start_m, mask_ptrs, stride_maskn,
+                                    BLOCK_M, HEAD_DIM, BLOCK_N,  
+                                    4 - STAGE, offs_m, offs_n 
+                                    )
+    acc = acc / l_i[:, None] # 相当于 softmax 滞后除法。
+    tl.store(O_block_ptr, acc.to(Out.type.element_ty), mask = (offs_m[:, None] < qo_len))
+
+    if RETURN_LSE:
+        lse_ptrs = Lse + (off_z * qo_len * H + off_h * qo_len) + offs_m
+        l_i = tl.log2(l_i) + m_i
+        tl.store(lse_ptrs, l_i, mask = (offs_m < qo_len))
+
+
+def forward_qk_fp16_pv_fp16_v2(q, k, v, tensor_layout="HND", attn_mask=None, output_dtype=torch.float32, return_lse=False):
+    BLOCK_M = 128
+    BLOCK_N = 32
+    stage = 1
+
+    o = torch.empty(q.shape, dtype=output_dtype, device=q.device)
+
+    if tensor_layout == "HND":
+        b, h_qo, qo_len, head_dim = q.shape
+        _, h_kv, kv_len, _ = k.shape
+
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(1), q.stride(2)
+        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(1), k.stride(2)
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(1), v.stride(2)
+        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(1), o.stride(2)
+    elif tensor_layout == "NHD":
+        b, qo_len, h_qo, head_dim = q.shape
+        _, kv_len, h_kv, _ = k.shape
+
+        stride_bz_q, stride_h_q, stride_seq_q = q.stride(0), q.stride(2), q.stride(1)
+        stride_bz_k, stride_h_k, stride_seq_k = k.stride(0), k.stride(2), k.stride(1)
+        stride_bz_v, stride_h_v, stride_seq_v = v.stride(0), v.stride(2), v.stride(1)
+        stride_bz_o, stride_h_o, stride_seq_o = o.stride(0), o.stride(2), o.stride(1)
+    else:
+        raise ValueError(f"tensor_layout {tensor_layout} not supported")
+
+    if attn_mask is not None:
+        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = attn_mask.stride(0), attn_mask.stride(1), attn_mask.stride(2), attn_mask.stride(3)
+    else:
+        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask = 0, 0, 0, 0
+
+    HEAD_DIM_K = head_dim
+    num_kv_groups = h_qo // h_kv
+
+    if return_lse:
+        lse = torch.empty([b, h_qo, qo_len], dtype=torch.float32, device=q.device)
+    else:
+        lse = torch.empty([0], dtype=torch.float32, device='cpu')
+
+    grid = (triton.cdiv(qo_len, BLOCK_M), h_qo, b) # grid 是按照 q来划分的， N是内部的for循环，对应的是 b, h, len_k / BLOCK_N的划分，其中，按照规则，b和h是对应的，类似于矩阵乘法。
+    _attn_fwd_qk_fp16_pv_fp16_v2[grid](
+        q, k, v, o, attn_mask, lse,
+        stride_bz_q, stride_h_q, stride_seq_q, 
+        stride_bz_k, stride_h_k, stride_seq_k,  
+        stride_bz_v, stride_h_v, stride_seq_v,  
+        stride_bz_o, stride_h_o, stride_seq_o,
+        stride_bz_mask, stride_h_mask, stride_m_mask, stride_n_mask,
+        qo_len, kv_len,
+        h_qo, num_kv_groups,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, HEAD_DIM=HEAD_DIM_K,   # q_split, N, head_dim # 其中N 是
+        STAGE=stage, RETURN_LSE=return_lse,
+        num_warps=4 if head_dim == 64 else 8,
+        num_stages=3 if head_dim == 64 else 4)
+
+    return o, lse
+
+
+
 def atten_forward_triton_new_sageatten(q, k, v, attn_mask=None):
-    v = v.to(torch.float16)
+    v_fp16 = v.to(torch.float16)
     tensor_layout="HND"
     output_dtype=torch.float32
     km = None
+
+    head_dim_og = q.size(-1)
+
+    if head_dim_og < 64:
+        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
+    elif head_dim_og > 64 and head_dim_og < 128:
+        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
+    elif head_dim_og > 128:
+        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    # if sm_scale is None:
+    sm_scale = 1.0 / (head_dim_og ** 0.5) # 这里会将默认的缩放因子放到量化的scale中
     
+    import time
+    time_start = time.time()
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
+    # torch.cuda.synchronize()
+    # time_end = time.time()
+    # print(f"per block int8 quant time: {(time_end - time_start) * 1000 :.6f} ms")
+    time_start = time.time()
+    o, lse = forward_qk_int8_pv_fp16(q_int8, k_int8, v_fp16, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=output_dtype, attn_mask=attn_mask, return_lse=False)
+      # torch.cuda.synchronize()
+    # time_end = time.time()
+    # print(f"per block int8 compute time: {(time_end - time_start) * 1000 :.6f} ms")
+    return o
+
+
+def atten_forward_triton_new_sageatten_fp16(q, k, v, attn_mask=None):
     
+    tensor_layout="HND"
+    output_dtype=torch.float32
+    km = None
+
     head_dim_og = q.size(-1)
 
     if head_dim_og < 64:
@@ -724,46 +669,56 @@ def atten_forward_triton_new_sageatten(q, k, v, attn_mask=None):
     elif head_dim_og > 128:
         raise ValueError(f"Unsupported head_dim: {head_dim_og}")
 
+    o_fp16, _ = forward_qk_fp16_pv_fp16(q, k, v, tensor_layout=tensor_layout, output_dtype=output_dtype, attn_mask=attn_mask, return_lse=False)
+  
+    return o_fp16
 
-    # if sm_scale is None:
-    sm_scale = 1.0 / (head_dim_og ** 0.5)
-    
-    
-    import time
-    time_start = time.time()
-    q_int8, q_scale, k_int8, k_scale = per_block_int8(q, k, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
-    # torch.cuda.synchronize()
-    # time_end = time.time()
-    # print(f"per block int8 quant time: {(time_end - time_start) * 1000 :.6f} ms")
-    time_start = time.time()
-    o, lse = forward(q_int8, k_int8, v, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=output_dtype, attn_mask=attn_mask, return_lse=False)
-    # torch.cuda.synchronize()
-    # time_end = time.time()
-    # print(f"per block int8 compute time: {(time_end - time_start) * 1000 :.6f} ms")
-    return o
+def atten_forward_triton_new_sageatten_fp16_v2(q, k, v, attn_mask=None):
+    q = q.to(torch.float16)
+    k = k.to(torch.float16)
+    v = v.to(torch.float16)
+    tensor_layout="HND"
+    output_dtype=torch.float16
+    km = None
 
+    head_dim_og = q.size(-1)
+
+    if head_dim_og < 64:
+        q = torch.nn.functional.pad(q, (0, 64 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 64 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 64 - head_dim_og))
+    elif head_dim_og > 64 and head_dim_og < 128:
+        q = torch.nn.functional.pad(q, (0, 128 - head_dim_og))
+        k = torch.nn.functional.pad(k, (0, 128 - head_dim_og))
+        v = torch.nn.functional.pad(v, (0, 128 - head_dim_og))
+    elif head_dim_og > 128:
+        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+
+    o_fp16, _ = forward_qk_fp16_pv_fp16_v2(q, k, v, tensor_layout=tensor_layout, output_dtype=output_dtype, attn_mask=attn_mask, return_lse=False)
+  
+    return o_fp16
 
 # 输入还是 q,k,v 是fp32，用于测试精度
-def atten_forward_triton(q, k, v, attn_mask=None):
-    tensor_layout="HND"
-    output_dtype=torch.float32
+# def atten_forward_triton(q, k, v, attn_mask=None):
+#     tensor_layout="HND"
+#     output_dtype=torch.float32
 
-    # quantize q,k,v to int8
-    q_scale = torch.max(torch.abs(q), dim=-1, keepdim=True)[0] / 127.0
-    k_scale = torch.max(torch.abs(k), dim=-1, keepdim=True)[0] / 127.0
-    v_scale = torch.max(torch.abs(v), dim=-1, keepdim=True)[0] / 127.0
-    q_int8 = (q / q_scale).round().clamp(-128, 127).to(torch.int8)
-    k_int8 = (k / k_scale).round().clamp(-128, 127).to(torch.int8)
-    v_int8 = (v / v_scale).round().clamp(-128, 127).to(torch.int8)
+#     # quantize q,k,v to int8
+#     q_scale = torch.max(torch.abs(q), dim=-1, keepdim=True)[0] / 127.0
+#     k_scale = torch.max(torch.abs(k), dim=-1, keepdim=True)[0] / 127.0
+#     v_scale = torch.max(torch.abs(v), dim=-1, keepdim=True)[0] / 127.0
+#     q_int8 = (q / q_scale).round().clamp(-128, 127).to(torch.int8)
+#     k_int8 = (k / k_scale).round().clamp(-128, 127).to(torch.int8)
+#     v_int8 = (v / v_scale).round().clamp(-128, 127).to(torch.int8)
  
-    q_fp16 = q.to(torch.float16)
-    k_fp16 = k.to(torch.float16)
-    v_fp16 = v.to(torch.float16)
+#     q_fp16 = q.to(torch.float16)
+#     k_fp16 = k.to(torch.float16)
+#     v_fp16 = v.to(torch.float16)
 
-    o_int8_int8 = atten_forward(_attn_fwd_qk_int8_pv_int8, q_int8, k_int8, v_int8, q_scale.to(torch.float16), k_scale.to(torch.float16), v_scale.to(torch.float16), tensor_layout=tensor_layout, attn_mask=attn_mask, output_dtype=output_dtype)
-    o_int8_fp16 = atten_forward(_attn_fwd_qk_int8_pv_fp16, q_int8, k_int8, v_fp16, q_scale.to(torch.float16), k_scale.to(torch.float16), v_scale.to(torch.float16), tensor_layout=tensor_layout, attn_mask=attn_mask, output_dtype=output_dtype)
-    o_fp16_fp16 = atten_forward(_attn_fwd_qk_fp16_pv_fp16, q_fp16, k_fp16, v_fp16, q_scale.to(torch.float16), k_scale.to(torch.float16), v_scale.to(torch.float16), tensor_layout=tensor_layout, attn_mask=attn_mask, output_dtype=output_dtype)
-    return o_int8_int8, o_int8_fp16, o_fp16_fp16
+#     o_int8_int8 = atten_forward(_attn_fwd_qk_int8_pv_int8, q_int8, k_int8, v_int8, q_scale.to(torch.float16), k_scale.to(torch.float16), v_scale.to(torch.float16), tensor_layout=tensor_layout, attn_mask=attn_mask, output_dtype=output_dtype)
+#     o_int8_fp16 = atten_forward(_attn_fwd_qk_int8_pv_fp16, q_int8, k_int8, v_fp16, q_scale.to(torch.float16), k_scale.to(torch.float16), v_scale.to(torch.float16), tensor_layout=tensor_layout, attn_mask=attn_mask, output_dtype=output_dtype)
+#     o_fp16_fp16 = atten_forward(_attn_fwd_qk_fp16_pv_fp16, q_fp16, k_fp16, v_fp16, q_scale.to(torch.float16), k_scale.to(torch.float16), v_scale.to(torch.float16), tensor_layout=tensor_layout, attn_mask=attn_mask, output_dtype=output_dtype)
+#     return o_int8_int8, o_int8_fp16, o_fp16_fp16
 
 
 def functional_attention_torch(query, key, value, attn_mask=None, scale=None, is_causal=False):
@@ -823,15 +778,55 @@ if __name__ == "__main__":
 
     # No mask
     # attn_output_triton_int8_int8, attn_output_triton_int8_fp16, attn_output_triton_fp16_fp16 = atten_forward_triton(query, key, value)
-    # attn_output_torch = functional_attention_torch(query, key, value)
+    attn_output_torch = functional_attention_torch(query, key, value)
     
-    # attn_output_triton_new_sageatten = atten_forward_triton_new_sageatten(query, key, value)
+    v_fp16 = value.to(torch.float16)
+    tensor_layout="HND"
+    output_dtype=torch.float32
+    km = None
+
+    head_dim_og = query.size(-1)
+
+    if head_dim_og < 64:
+        query = torch.nn.functional.pad(query, (0, 64 - head_dim_og))
+        key = torch.nn.functional.pad(key, (0, 64 - head_dim_og))
+        value = torch.nn.functional.pad(value, (0, 64 - head_dim_og))
+    elif head_dim_og > 64 and head_dim_og < 128:
+        query = torch.nn.functional.pad(query, (0, 128 - head_dim_og))
+        key = torch.nn.functional.pad(key, (0, 128 - head_dim_og))
+        value = torch.nn.functional.pad(value, (0, 128 - head_dim_og))
+    elif head_dim_og > 128:
+        raise ValueError(f"Unsupported head_dim: {head_dim_og}")
+    # if sm_scale is None:
+    sm_scale = 1.0 / (head_dim_og ** 0.5) # 这里会将默认的缩放因子放到量化的scale中
+    
+    import time
+    time_start = time.time()
+    q_int8, q_scale, k_int8, k_scale = per_block_int8(query, key, km=km, sm_scale=sm_scale, tensor_layout=tensor_layout)
+    # torch.cuda.synchronize()
+    # time_end = time.time()
+    # print(f"per block int8 quant time: {(time_end - time_start) * 1000 :.6f} ms")
+    time_start = time.time()
+    out_int8, lse = forward_qk_int8_pv_fp16(q_int8, k_int8, v_fp16, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=output_dtype)
+      # torch.cuda.synchronize()
+    
+    # out_int8 = atten_forward_triton_new_sageatten(query, key, value)
+    out_fp16 = atten_forward_triton_new_sageatten_fp16(query, key, value)
+    out_fp16_v2 = atten_forward_triton_new_sageatten_fp16_v2(query, key, value).to(torch.float32)
 
     # # compute cosine similarity between outputs
     # cos_sim_int8_int8 = torch.nn.functional.cosine_similarity(attn_output_triton_int8_int8, attn_output_torch)
     # cos_sim_int8_fp16 = torch.nn.functional.cosine_similarity(attn_output_triton_int8_fp16, attn_output_torch)
     # cos_sim_fp16_fp16 = torch.nn.functional.cosine_similarity(attn_output_triton_fp16_fp16, attn_output_torch)
-    # cos_sim_new_sageatten = torch.nn.functional.cosine_similarity(attn_output_triton_new_sageatten, attn_output_torch)
+    cos_sim_out_int8 = torch.nn.functional.cosine_similarity(out_int8, attn_output_torch)
+    cos_sim_out_fp16 = torch.nn.functional.cosine_similarity(out_fp16, attn_output_torch)
+    cos_sim_out_fp16_v2 = torch.nn.functional.cosine_similarity(out_fp16_v2, attn_output_torch)
+    
+    print("Cosine similarity (out_int8):", cos_sim_out_int8.mean().item())
+    print("Cosine similarity (out_fp16):", cos_sim_out_fp16.mean().item())
+    print("Cosine similarity (out_fp16_v2):", cos_sim_out_fp16_v2.mean().item())
+    
+    
 
     # # print first 10 results
     # print("Results attn_output_triton_int8_int8 :", attn_output_triton_int8_int8.flatten()[0:25])
@@ -866,6 +861,38 @@ if __name__ == "__main__":
         end = time.time()
         
         sage_atten_time += (end - start)
+        
+    # _ = atten_forward_triton_new_sageatten(query, key, value)
+    out_int8, lse = forward_qk_int8_pv_fp16(q_int8, k_int8, v_fp16, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=output_dtype)
+    sage_atten_time_compute = 0.0
+    for _ in range(loop_run):
+        start = time.time()
+        # _ = atten_forward_triton_new_sageatten(query, key, value)
+        out_int8, lse = forward_qk_int8_pv_fp16(q_int8, k_int8, v_fp16, q_scale, k_scale, tensor_layout=tensor_layout, output_dtype=output_dtype)
+        torch.cuda.synchronize()
+        end = time.time()
+        
+        sage_atten_time_compute += (end - start)
+        
+    _ = atten_forward_triton_new_sageatten_fp16(query, key, value)
+    sage_atten_time_fp16 = 0.0
+    for _ in range(loop_run):
+        start = time.time()
+        _ = atten_forward_triton_new_sageatten_fp16(query, key, value)
+        torch.cuda.synchronize()
+        end = time.time()
+        
+        sage_atten_time_fp16 += (end - start)
+    
+    _ = atten_forward_triton_new_sageatten_fp16_v2(query, key, value)
+    sage_atten_time_fp16_v2 = 0.0
+    for _ in range(loop_run):
+        start = time.time()
+        _ = atten_forward_triton_new_sageatten_fp16_v2(query, key, value)
+        torch.cuda.synchronize()
+        end = time.time()
+        
+        sage_atten_time_fp16_v2 += (end - start)
     
     _ = functional_attention_torch(query, key, value)
     naive_atten_time = 0.0
@@ -878,6 +905,8 @@ if __name__ == "__main__":
         naive_atten_time += (end - start)
     
     print(f"SageAtten time: {sage_atten_time / loop_run * 1000:.2f} ms")
+    print(f"SageAtten compute time: {sage_atten_time_compute / loop_run * 1000:.2f} ms")
     print(f"Naive Atten time: {naive_atten_time / loop_run * 1000:.2f} ms")
-    
+    print(f"SageAtten FP16 time: {sage_atten_time_fp16 / loop_run * 1000:.2f} ms")
+    print(f"SageAtten FP16 v2 time: {sage_atten_time_fp16_v2 / loop_run * 1000:.2f} ms")
         
